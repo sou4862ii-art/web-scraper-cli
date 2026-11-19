@@ -3,6 +3,7 @@
 import csv
 import logging
 import time
+from pathlib import Path
 from dataclasses import dataclass, fields
 from typing import Iterator
 from urllib.parse import urljoin
@@ -20,6 +21,9 @@ RATING_MAP = {
     "Five": 5,
 }
 
+# 一時的な失敗とみなして再試行する HTTP ステータス
+RETRY_STATUSES = {429, 500, 502, 503, 504}
+
 logger = logging.getLogger(__name__)
 
 
@@ -36,15 +40,26 @@ class ScraperError(Exception):
     """HTTP エラーやパースエラーをまとめる例外。"""
 
 
+class _Retryable(Exception):
+    """再試行すべき一時的な HTTP エラー（内部用）。"""
+
+
 class BookScraper:
     def __init__(
         self,
         base_url: str = BASE_URL,
         delay: float = 1.0,
         session: requests.Session | None = None,
+        retries: int = 2,
+        retry_wait: float = 2.0,
     ) -> None:
+        if delay < 0 or retries < 0 or retry_wait < 0:
+            raise ValueError("delay・retries・retry_wait は 0 以上で指定してください")
         self.base_url = base_url
         self.delay = delay
+        self.retries = retries
+        self.retry_wait = retry_wait
+        self.skipped = 0  # 読み取れずに飛ばした書籍の数
         self._session = session or requests.Session()
         self._session.headers["User-Agent"] = (
             "Mozilla/5.0 (compatible; BookScraperCLI/1.0; "
@@ -71,6 +86,7 @@ class BookScraper:
     def save_csv(self, books: list[Book], path: str) -> None:
         """UTF-8 BOM 付き CSV で保存する (Excel 対応)。"""
         column_names = [f.name for f in fields(Book)]
+        Path(path).parent.mkdir(parents=True, exist_ok=True)  # 保存先フォルダが無ければ作る
         with open(path, "w", newline="", encoding="utf-8-sig") as fh:
             writer = csv.DictWriter(fh, fieldnames=column_names)
             writer.writeheader()
@@ -106,27 +122,46 @@ class BookScraper:
             page_url = urljoin(page_url, next_tag["href"]) if next_tag else None
 
     def _get_soup(self, url: str) -> BeautifulSoup:
-        logger.debug("GET %s", url)
-        try:
-            resp = self._session.get(url, timeout=10)
-            resp.raise_for_status()
-        except requests.RequestException as exc:
-            raise ScraperError(f"Request failed: {url}") from exc
-        return BeautifulSoup(resp.text, "lxml")
+        """ページを取得する。接続エラー・タイムアウト・429/5xx は、待ち時間を延ばしながら再試行する。"""
+        attempts = self.retries + 1
+        for attempt in range(1, attempts + 1):
+            logger.debug("GET %s (%d/%d)", url, attempt, attempts)
+            try:
+                resp = self._session.get(url, timeout=10)
+                if resp.status_code in RETRY_STATUSES and attempt < attempts:
+                    raise _Retryable(f"HTTP {resp.status_code}")
+                resp.raise_for_status()
+                return BeautifulSoup(resp.text, "lxml")
+            except (_Retryable, requests.ConnectionError, requests.Timeout) as exc:
+                if attempt == attempts:
+                    raise ScraperError(f"Request failed: {url}") from exc
+                wait = self.retry_wait * attempt
+                logger.warning("取得に失敗しました (%s)。%.1f 秒後に再試行します: %s", exc, wait, url)
+                time.sleep(wait)
+            except requests.RequestException as exc:
+                raise ScraperError(f"Request failed: {url}") from exc
+        raise ScraperError(f"Request failed: {url}")  # pragma: no cover
 
     def _parse_page(self, soup: BeautifulSoup, page_url: str) -> list[Book]:
         books = []
         for article in soup.select("article.product_pod"):
-            books.append(self._parse_article(article, page_url))
+            try:
+                books.append(self._parse_article(article, page_url))
+            except (ValueError, KeyError, IndexError) as exc:
+                # 1件の崩れたデータで全体を止めない。飛ばした件数は self.skipped に数える
+                self.skipped += 1
+                logger.warning("書籍情報を読み取れなかったため飛ばしました (%s): %s", exc, page_url)
         return books
 
     def _parse_article(self, article: BeautifulSoup, page_url: str) -> Book:
         # タイトル
         title_tag = article.select_one("h3 a")
-        title = title_tag["title"] if title_tag else ""
+        title = title_tag.get("title", "") if title_tag else ""
+        if not title:
+            raise ValueError("タイトルがありません")
 
         # 詳細ページ URL
-        href = title_tag["href"] if title_tag else ""
+        href = title_tag.get("href", "")
         # catalogue/ から始まる相対パスを絶対 URL に変換
         book_url = urljoin(page_url, href)
 
@@ -137,8 +172,8 @@ class BookScraper:
 
         # 評価 (クラス名 "rating One" など)
         rating_tag = article.select_one("p.star-rating")
-        rating_class = rating_tag["class"][1] if rating_tag else "Zero"
-        rating = RATING_MAP.get(rating_class, 0)
+        rating_classes = rating_tag.get("class", [])[1:] if rating_tag else []
+        rating = next((RATING_MAP[c] for c in rating_classes if c in RATING_MAP), 0)
 
         # 在庫
         avail_tag = article.select_one("p.availability")

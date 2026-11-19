@@ -149,7 +149,7 @@ class TestFetchBooks:
         session = MagicMock(spec=requests.Session)
         session.headers = {}
         session.get = MagicMock(side_effect=side_effects)
-        return BookScraper(delay=0, session=session)
+        return BookScraper(delay=0, session=session, retry_wait=0)
 
     def test_returns_requested_count(self):
         scraper = self._make_scraper(
@@ -174,15 +174,44 @@ class TestFetchBooks:
         assert len(books) == 3
 
     def test_raises_scraper_error_on_http_error(self):
-        scraper = self._make_scraper([_make_response("", status=500)])
+        # 500 は一時的な失敗として再試行し（既定 2 回）、それでも駄目ならエラー
+        scraper = self._make_scraper([_make_response("", status=500)] * 3)
         with pytest.raises(ScraperError):
             scraper.fetch_books(max_books=1)
+        assert scraper._session.get.call_count == 3
+
+    def test_retries_then_succeeds(self):
+        scraper = self._make_scraper(
+            [requests.Timeout("slow"), _make_response("", status=503), _make_response(PAGE2_HTML)]
+        )
+        books = scraper.fetch_books(max_books=0)
+        assert [b.title for b in books] == ["Soumission"]
+        assert scraper._session.get.call_count == 3
+
+    def test_404_is_not_retried(self):
+        scraper = self._make_scraper([_make_response("", status=404)])
+        with pytest.raises(ScraperError):
+            scraper.fetch_books(max_books=1)
+        assert scraper._session.get.call_count == 1
+
+    def test_broken_book_is_skipped_not_fatal(self):
+        broken = PAGE2_HTML.replace("£50.10", "価格未定")
+        page = PAGE1_HTML.replace('<li class="next"><a href="catalogue/page-2.html">next</a></li>', "")
+        page = page.replace("</ol>", broken[broken.index("<li>"):broken.index("</ol>")] + "</ol>")
+        scraper = self._make_scraper([_make_response(page)])
+        books = scraper.fetch_books(max_books=0)
+        assert [b.title for b in books] == ["A Light in the Attic", "Tipping the Velvet"]
+        assert scraper.skipped == 1
+
+    def test_negative_settings_are_rejected(self):
+        with pytest.raises(ValueError):
+            BookScraper(delay=-1)
 
     def test_raises_scraper_error_on_connection_error(self):
         session = MagicMock(spec=requests.Session)
         session.headers = {}
         session.get = MagicMock(side_effect=requests.ConnectionError("timeout"))
-        scraper = BookScraper(delay=0, session=session)
+        scraper = BookScraper(delay=0, session=session, retry_wait=0)
         with pytest.raises(ScraperError):
             scraper.fetch_books(max_books=1)
 
@@ -226,6 +255,11 @@ class TestSaveCsv:
         assert rows[0]["title"] == "Test Book"
         assert float(rows[0]["price"]) == pytest.approx(9.99)
         assert int(rows[0]["rating"]) == 4
+
+    def test_creates_missing_folders(self, tmp_path: Path):
+        path = tmp_path / "output" / "sub" / "books.csv"
+        BookScraper(delay=0).save_csv(self.BOOKS, str(path))
+        assert path.exists()
 
     def test_utf8_bom(self, tmp_path: Path):
         """Excel が正しく開けるよう BOM が付いていること。"""
@@ -280,4 +314,33 @@ class TestCli:
             instance = MockScraper.return_value
             instance.fetch_books.side_effect = ScraperError("boom")
             code = main(["-o", str(out)])
+        assert code == 1
+
+    @pytest.mark.parametrize("argv", [["-n", "-1"], ["--delay", "-0.5"], ["--retries", "-1"], ["-n", "abc"]])
+    def test_rejects_invalid_numbers(self, argv, capsys):
+        from src.cli import build_parser
+
+        with pytest.raises(SystemExit) as exc_info:
+            build_parser().parse_args(argv)
+        assert exc_info.value.code == 2
+
+    def test_main_reports_skipped_books(self, tmp_path: Path, capsys):
+        from src.cli import main
+
+        with patch("src.cli.BookScraper") as MockScraper:
+            instance = MockScraper.return_value
+            instance.fetch_books.return_value = [Book("X", 1.0, 3, True, "https://example.com")]
+            instance.skipped = 2
+            code = main(["-o", str(tmp_path / "r.csv")])
+        assert code == 0
+        assert "2 件を飛ばしました" in capsys.readouterr().out
+
+    def test_main_returns_one_on_write_error(self, tmp_path: Path):
+        from src.cli import main
+
+        with patch("src.cli.BookScraper") as MockScraper:
+            instance = MockScraper.return_value
+            instance.fetch_books.return_value = []
+            instance.save_csv.side_effect = PermissionError("locked")
+            code = main(["-o", str(tmp_path / "r.csv")])
         assert code == 1
